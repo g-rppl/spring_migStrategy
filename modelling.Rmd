@@ -1,0 +1,1009 @@
+---
+title: Analysing individual departure and routing decisions in migratory birds using a multistate modelling approach
+subtitle: "**R code**"
+author: Georg Rüppel, Ommo Hüppop, Heiko Schmaljohann & Vera Brust
+date: 2022
+output:
+ html_document:
+   toc: true
+   toc_depth: 1
+   toc_float:
+     collapsed: false
+     smooth_scroll: true
+---
+
+```{r setup, include=FALSE}
+
+
+########## setup ##########
+
+##### load packages #####
+
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(grid)
+library(gridExtra)
+library(coda)
+library(HDInterval)
+library(cmdstanr)
+library(shinystan)
+
+knitr::opts_chunk$set(echo = F, message = F, warning = F)
+
+##### load data #####
+
+load("data_individuals.RData")
+load("data_weather.RData")
+load("data_detection-history.RData")
+load("model_summaries.RData")
+
+##### source helper functions #####
+
+source("fun_diagnostics.R")
+
+##### additional variables #####
+
+# colours and styles
+clrs <- c("#999999", "#632770", "#AA7539","#27566B", "#9AA637")
+
+txt_styl <- c("plain", "italic", "plain", "plain", "plain")
+
+# species
+sp_f <- factor(c("Dunnock", "thrushes", "Blackcap", "Garden W.", "Wheatear"),
+               levels = c("Dunnock", "thrushes", "Blackcap", "Garden W.", "Wheatear"), ordered = T)
+n.sp <- length(sp_f)
+
+```
+
+# Minimum stopover duration
+
+```{r model minimum stopover duration}
+
+
+########## data preparation ##########
+
+tmp <- mod.data %>%
+  filter(flightCat != "departed") 
+tmp$min_stopover <- as.numeric(tmp$min_stopover)
+tmp$x.tmp <- ifelse(tmp$flightCat == "offshore", 0, 1)
+
+sp <- as.factor(tmp$speciesEN)
+n.sp <- length(levels(sp))
+levels(sp) <- 1:n.sp
+sp <- as.numeric(sp)
+
+st <- as.factor(tmp$flightCat)
+n.st <- length(levels(st))
+levels(st) <- 1:n.st
+st <- as.numeric(st)
+
+
+########## model ##########
+
+# bundle data
+stan.data <- list(y = c(tmp$min_stopover), Nind = nrow(tmp), Nsp = n.sp,  
+                  sp = sp, st = st)
+
+# compile
+mod1 <- cmdstan_model("min_stopover.stan", cpp_options = list(stan_threads = TRUE))
+
+# sample
+mod1 <- mod1$sample(
+  data = stan.data, seed = 49,
+  chains = 4, parallel_chains = 4, threads_per_chain = 3,
+  adapt_delta = 0.99, refresh = 1000
+)
+
+# draws
+drws <- mod1$draws(c("b", "mu", "sigma", "phi"), format = "df")
+drws[,1:14] <- exp(drws[,1:14])   # log transformation
+
+# summary
+smry.mod1 <- rbind(mod_smry(mod1,  "b", exp),
+                   mod_smry(mod1, "mu", exp),
+                   mod_smry(mod1, "sigma", exp),
+                   mod_smry(mod1, "phi"))
+smry.mod1
+
+##### pp check #####
+
+nsim <- 100
+yrep <- mod1$draws("yrep", format = "df")
+
+# per species
+for (i in 1:n.sp) {
+  y.s   <- tmp$min_stopover[tmp$speciesEN == sp_f[i]]
+  y.rep <- as.matrix(yrep[round(runif(nsim, 1, nrow(yrep))), which(tmp$speciesEN == sp_f[i])])
+  
+  plot(density(y.s), main = sp_f[i])
+  for (j in 1:nsim){
+    lines(density(y.rep[j,]), col = rgb(0.69, 0.89, 1, alpha = 0.5))
+  }
+  lines(density(y.s), lwd = 5, main = sp_f[i])
+}
+
+# per routing
+for (i in 1:2) {
+  y.s  <- tmp$min_stopover[which(st == i)]
+  y.rep <- as.matrix(yrep[round(runif(nsim, 1, nrow(yrep))), which(st == i)])
+  
+  plot(density(y.s), main = ifelse(i == 1, "offshore", "onshore"))
+  for (j in 1:nsim){
+    lines(density(y.rep[j,]), col = rgb(0.69, 0.89, 1, alpha = 0.5))
+  }
+  lines(density(y.s), lwd = 5)
+}
+
+# launch_shinystan(mod1)
+
+##### contrasts #####
+
+# per species
+con.mod1 <- data.frame(row.names = sp_f)
+
+d.mod1 <- as.matrix(drws[,6:10] - drws[,1:5])
+con.mod1$mean  <- apply(d.mod1, 2, mean)
+con.mod1$lower <- apply(d.mod1, 2, function(x) hdi(x, 0.9))[1,]
+con.mod1$upper <- apply(d.mod1, 2, function(x) hdi(x, 0.9))[2,]
+con.mod1$f     <- apply(d.mod1, 2, function(x) ifelse(mean(x) > 0, sum(x > 0), sum(x < 0)) / nrow(d.mod1))
+
+# mean per routing
+d.mod1 <- as.matrix(drws[,"mu[2]"] - drws[,"mu[1]"])
+diff_route.mod1 <- c(mean(d.mod1), 
+                     hdi(d.mod1, 0.9),
+                     ifelse(mean(d.mod1) > 0, sum(d.mod1 > 0), sum(d.mod1 < 0)) / nrow(d.mod1))
+
+con.mod1        <- rbind(con.mod1, mean = diff_route.mod1)
+diff_route.mod1 <- round(diff_route.mod1, 1)
+
+# per strategy
+d.mod1 <- rowMeans(drws[,c(1:3, 6:8)]) - rowMeans(drws[,c(4:5, 9:10)])
+diff_strategy.mod1 <- round(c(mean(d.mod1), hdi(d.mod1, 0.9)), 1)
+
+##### plot #####
+
+pp <- expand.grid(sp = sp_f,
+                  st = c(0:1))
+pp <- cbind(pp, smry.mod1[1:10, 1:3])
+colnames(pp)[4:5] <- c("lwr", "upr")
+
+g1 <- ggplot(pp, aes(y = mean)) +
+  ggdist::stat_dots(aes(x = x.tmp, y = min_stopover, group = speciesEN, color = speciesEN), data = tmp, 
+                    position = position_dodge(width = 0.8), size = 5, alpha = 0.2) +
+  geom_linerange(aes(x = st, ymin = lwr, ymax = upr, color = sp), lwd = 2, alpha = 0.8,
+                 position = position_dodge(width = 0.8)) +
+  geom_text(aes(x = st, color = sp), label = "|", size = 7, vjust = 0.34,
+            position = position_dodge(width = 0.8)) +
+  scale_x_continuous(breaks = 0:1, minor_breaks = NULL, labels = c("offshore", "onshore"),
+                     limits = c(-0.5, 1.5)) + 
+  scale_color_manual(values = clrs) + coord_flip() +
+  labs(x = NULL, y = "minimum stopover duration [d]") +
+  theme_bw(base_size = 20) + theme(legend.position = "none")
+
+```
+
+## Inspect model parameter convergence {-}
+
+Checking chains for convergence.
+
+```{r check convergence mod1, echo=FALSE, out.width='90%', fig.align = "center"}
+diagMCMC(drws)
+```
+
+# Departure relative to night length
+
+```{r model departure relative to night length}
+
+
+########## model ##########
+
+# bundle data
+stan.data <- list(y = c(tmp$s.r), Nind = nrow(tmp), Nsp = n.sp,
+                  sp = sp, st = st)
+
+# compile
+mod2 <- cmdstan_model("dep_time.stan", cpp_options = list(stan_threads = TRUE))
+
+# sample
+mod2 <- mod2$sample(
+  data = stan.data, seed = 49,
+  chains = 4, parallel_chains = 4, threads_per_chain = 3,
+  refresh = 1000
+)
+
+params <- c("b", "sigma", "v")
+
+# draws
+drws <- mod2$draws(params, format = "df")
+
+# summary
+smry.mod2 <- mod_smry(mod2, params)
+smry.mod2
+
+##### pp check #####
+
+nsim <- 100
+yrep <- mod2$draws("yrep", format = "df")
+
+# per species
+for (i in 1:n.sp) {
+  y.s   <- tmp$s.r[tmp$speciesEN == sp_f[i]]
+  y.rep <- as.matrix(yrep[round(runif(nsim, 1, nrow(yrep))), which(tmp$speciesEN == sp_f[i])])
+  
+  plot(density(y.s), main = sp_f[i])
+  for (j in 1:nsim){
+    lines(density(y.rep[j,]), col = rgb(0.69, 0.89, 1, alpha = 0.5))
+  }
+  lines(density(y.s), lwd = 5, main = sp_f[i])
+}
+
+# per routing
+for (i in 1:2) {
+  y.s  <- tmp$s.r[which(st == i)]
+  y.rep <- as.matrix(yrep[round(runif(nsim, 1, nrow(yrep))), which(st == i)])
+  
+  plot(density(y.s), main = ifelse(i == 1, "offshore", "onshore"))
+  for (j in 1:nsim){
+    lines(density(y.rep[j,]), col = rgb(0.69, 0.89, 1, alpha = 0.5))
+  }
+  lines(density(y.s), lwd = 5)
+}
+
+# launch_shinystan(mod2)
+
+##### contrasts #####
+
+# per species
+con.mod2 <- data.frame(row.names = sp_f)
+
+d.mod2 <- drws[,6:10] - drws[,1:5]
+con.mod2$mean  <- apply(d.mod2, 2, mean)
+con.mod2$lower <- apply(d.mod2, 2, function(x) hdi(x, 0.9))[1,]
+con.mod2$upper <- apply(d.mod2, 2, function(x) hdi(x, 0.9))[2,]
+con.mod2$f     <- apply(d.mod2, 2, function(x) ifelse(mean(x) > 0, sum(x > 0), sum(x < 0)) / nrow(d.mod2))
+
+# mean per routing
+d.mod2 <- as.matrix(rowMeans(drws[,6:10]) - rowMeans(drws[,1:5]))
+diff_route.mod2 <- c(mean(d.mod2), 
+                     hdi(d.mod2, 0.9),
+                     ifelse(mean(d.mod2) > 0, sum(d.mod2 > 0), sum(d.mod2 < 0)) / nrow(d.mod2))
+
+con.mod2        <- rbind(con.mod2, mean = diff_route.mod2)
+diff_route.mod2 <- round(diff_route.mod2, 3)*100
+
+##### plot #####
+
+pp <- expand.grid(sp = sp_f,
+                  st = c(0:1))
+pp <- cbind(pp, smry.mod2[1:10, c(1:3)])
+colnames(pp)[4:5] <- c("lwr", "upr")
+
+g2 <- ggplot(pp, aes(x = st, y = mean)) +
+  ggdist::stat_dots(aes(x = x.tmp, y = s.r, group = speciesEN, color = speciesEN), data = tmp, 
+                    position = position_dodge(width = 0.8), size = 5, alpha = 0.2) +
+  geom_linerange(aes(ymin = lwr, ymax = upr, color = sp), lwd = 2, alpha = 0.8, 
+                 position = position_dodge(width = 0.7)) +
+  geom_text(aes(color = sp), label = "|", size = 7, vjust = 0.34, 
+            position = position_dodge(width = 0.7)) + 
+  scale_x_continuous(breaks = 0:1, minor_breaks = NULL, labels = c("offshore", "onshore"), 
+                     limits = c(-0.5, 1.5)) +
+  scale_y_continuous(breaks = 0:1, labels = c("sunset", "sunrise")) + coord_flip() +
+  scale_color_manual(values = clrs) +
+  labs(x = NULL, y = "departure time relative to night length") +
+  theme_bw(base_size = 20) + theme(legend.position = "none")
+
+grid.arrange(g1, g2, heights = c(5, 5))
+
+```
+
+## Inspect model parameter convergence {-}
+
+Checking chains for convergence.
+
+```{r check convergence mod2, echo=FALSE, out.width='90%', fig.align = "center"}
+diagMCMC(drws)
+```
+
+# Multistate Model
+
+```{r ms, echo=FALSE}
+
+
+########## data preparation ##########
+
+sp <- as.numeric(mod.data$speciesEN)
+
+##### transformations #####
+
+u.poly <- poly(as.vector(u), 2)
+u.l <- matrix(u.poly[,1], ncol = ncol(dh))
+u.q <- matrix(u.poly[,2], ncol = ncol(dh))
+
+v.poly <- poly(as.vector(v), 2)
+v.l <- matrix(v.poly[,1], ncol = ncol(dh))
+v.q <- matrix(v.poly[,2], ncol = ncol(dh))
+
+pc.z <- scale(pc)
+h.z  <- scale(h)
+
+
+########## model ##########
+
+# bundle data
+stan.data <- list(y = dh, Nind = nrow(dh), Nocc = ncol(dh), Nsp = length(sp_f), 
+                  sp = sp,
+                  u_l = u.l, u_q = u.q, v_l = v.l, v_q = v.q, 
+                  pc_z = pc.z, h_z = h.z, 
+                  r = r)
+
+# compile
+ms <- cmdstan_model("ms.stan", cpp_options = list(stan_threads = TRUE))
+
+# sample
+ms <- ms$sample(
+  data = stan.data, seed = 49,
+  chains = 4, parallel_chains = 4, threads_per_chain = 3,
+  refresh = 1000
+)
+
+params <- c("mean_psi", "mu1", "b_u1_l", "b_u1_q", "b_v1_l", "b_v1_q", "b_p1", "b_h1", "b_r1",
+            "mean_chi", "mu2", "b_u2_l", "b_u2_q", "b_v2_l", "b_v2_q",
+            "pX", "pC", "Noff", "Nrel")
+
+# draws
+drws <- ms$draws(params, format = "df")
+
+# summary
+smry.ms <- mod_smry(ms, params)
+smry.ms
+
+save(drws, file = "ms_draws.RData")
+
+```
+
+## Effects
+
+### Departure timing
+
+```{r effects psi with interactions}
+
+
+########## custom sqrt transformation ##########
+
+S_sqrt  <- function(x){sign(x)*sqrt(abs(x))}
+IS_sqrt <- function(x){x^2*sign(x)}
+S_sqrt_trans <- function() scales::trans_new("S_sqrt", S_sqrt, IS_sqrt)
+
+
+########## psi ##########
+
+##### mean #####
+
+# per species
+smpls   <- 300
+tmp.t   <- as.data.frame(smry.ms[1:5,])
+tmp.t.r <- data.frame(sp  = rep(1:5, each = smpls),
+                      sim = c(get_draws("mean_psi")[1:smpls,]))
+
+g.t <- ggplot() +
+  geom_rect(aes(xmin = 3.5, xmax = Inf, ymin = -Inf, ymax = Inf), alpha = 0.2) +
+  geom_hline(yintercept = mean(tmp.t$mean), size = 1.5, alpha = 0.3) +
+  geom_jitter(data = tmp.t.r, aes(x = sp, y = sim, color = as.factor(sp)), width = 0.15, alpha = 0.1) +
+  geom_text(data = tmp.t, aes(x = 1:5, y = mean, angle = 90), 
+            label = "|", size = 10, vjust = 0.34, color = clrs[1:5]) +
+  geom_label(aes(x = 2, y = 0.9, label = "short"), label.size = NA) +
+  geom_label(aes(x = 4.5, y = 0.9, label = "long"), label.size = NA) +
+  scale_x_continuous(minor_breaks = NULL) +
+  scale_y_continuous(trans = "S_sqrt", breaks = seq(0, 1, 0.2), minor_breaks = seq(0.1, 0.9, 0.1), 
+                     limits = c(0, 1)) +
+  scale_color_manual(values = clrs[1:5]) +
+  labs(x = NULL, y = "departure\nprobability") + theme_bw(base_size = 20) + 
+  theme(legend.position = "none",
+        axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        plot.margin = unit(c(0.3, 0.05, 0.15, 0.2), "cm"))
+
+# contrast per strategy
+p_con.t <- rowMeans(get_draws("mean_psi")[,c(4:5)]) - rowMeans(get_draws("mean_psi")[,c(1:3)])
+
+g.t.st <- ggplot() +
+  tidybayes::stat_halfeye(aes(p_con.t), interval_size = 5, point_size = 3, 
+                          slab_fill = "#8B8682", slab_alpha = 0.5,
+                          point_interval = "mean_hdi", .width = 0.9) +
+  geom_vline(xintercept = 0, lty = 2) +
+  labs(x = NULL, y = NULL) +
+  scale_x_continuous(position = "top", breaks = c(-0.2, 0, 0.2), limits = c(-0.3, 0.3)) +
+  scale_y_continuous(breaks = 0, limits = c(-0.1, 1)) +
+  theme_bw(base_size = 20) + coord_flip() +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        panel.grid.major.y = element_blank(), panel.grid.minor.y = element_blank(),
+        plot.margin = unit(c(0.3, 0.3, 0.15, 0.5), "cm"))
+
+##### raw data #####
+
+# define data storage
+d_raw <- data.frame()
+
+# per individual
+for (i in 1:nrow(dh)) {
+  
+  fl <- min(which(dh[i,] > 1))
+  species <- sp_f[sp[i]]
+
+  # from tag deployment to flight
+  status <- c(rep(0, fl-1), 1)
+  raw_u  <- u[i, 1:fl]
+  raw_v  <- v[i, 1:fl]
+  raw_pc <- pc[i, 1:fl]
+  raw_h  <- h[i, 1:fl]
+  raw_r  <- r[i, 1:fl]
+  
+  d_raw <- rbind(d_raw, cbind.data.frame(species, status, raw_u, raw_v, raw_pc, raw_h, raw_r))
+  
+}
+
+##### u wind #####
+
+# define data storage
+pp  <- data.frame()
+sim <- data.frame()
+
+for (i in 1:n.sp) {
+  
+  # range per species
+  range_u <- seq(min(d_raw$raw_u[d_raw$species == sp_f[i]]), 
+                 max(d_raw$raw_u[d_raw$species == sp_f[i]]), length.out = 100)
+  
+  # expand grid
+  newdat <- expand.grid(u = range_u, 
+                        species = sp_f[i])
+  
+  # add transformed variables
+  newdat$u.l <- predict(u.poly, newdat$u)[,1]
+  newdat$u.q <- predict(u.poly, newdat$u)[,2]
+  
+  # model matrix & fitmat
+  Xmat   <- model.matrix(~ u.l + u.q, data = newdat)
+  fitmat <- matrix(ncol = nrow(drws), nrow = nrow(newdat))
+  
+  # matrices multiplication
+  for (j in 1:nrow(drws)) {
+    
+    fitmat[,j] <- plogis(Xmat %*% c(get_draws("mu1")[j,i],
+                                    get_draws("b_u1_l")[j,i],
+                                    get_draws("b_u1_q")[j,i]))
+    
+  }
+  
+  # obtain fit
+  newdat$fit <- plogis(mean(get_draws("mu1")[,i]) + 
+                       mean(get_draws("b_u1_l")[,i]) * newdat$u.l + 
+                       mean(get_draws("b_u1_q")[,i]) * newdat$u.q)
+  sim_sp <- cbind(species = sp_f[i], get_sims(newdat$u))
+  
+  
+  # store posterior predictions
+  pp  <- rbind(pp, newdat)
+  sim <- rbind(sim, sim_sp)
+  
+}
+
+# plot per species 
+g1 <- ggplot() +
+  geom_rect(data = data.frame(species = sp_f), aes(alpha = species), 
+            xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf) +
+  scale_alpha_manual(values = c(0, 0, 0, 0.2, 0.2)) + 
+  geom_line(aes(x = x, y = sim, group = draw, color = species), data = sim, alpha = 0.2) +
+  geom_line(data = pp, aes(x = u, y = fit, color = species), size = 2) +
+  facet_grid(. ~ species) +
+  geom_jitter(data = d_raw, aes(x = raw_u, y = status, color = species), height = 0.02, alpha = 0.3) +
+  geom_boxplot(data = d_raw[d_raw$status == 1,], aes(x = raw_u, y = 1), 
+               orientation = "y", width = 0.1, size = 1.4, alpha = 0) +
+  geom_boxplot(data = d_raw[d_raw$status == 0,], aes(x = raw_u, y = 0), 
+               orientation = "y", width = 0.1, size = 1.4, alpha = 0) +
+  scale_color_manual(values = clrs) + scale_fill_manual(values = clrs) +
+  scale_x_continuous(labels = c(-10, 0, 10), breaks = c(-10, 0, 10)) + 
+  scale_y_continuous(trans="S_sqrt", breaks = seq(0, 1, 0.2), minor_breaks = seq(0.1, 0.9, 0.1)) +
+  labs(x = "eastward wind [m/s]", y = NULL) +
+  theme_bw(base_size = 20) + theme(legend.position = "none", strip.text = element_text(face = txt_styl))
+
+g1 <- ggplotGrob(g1)
+
+g1$grobs[[20]]$grobs[[1]]$children[[2]]$children[[1]]$gp$font <- as.integer(3)
+attr(g1$grobs[[20]]$grobs[[1]]$children[[2]]$children[[1]]$gp$font,"names") <- "italic"
+
+##### v wind #####
+
+# define data storage
+pp  <- data.frame()
+sim <- data.frame()
+
+for (i in 1:n.sp) {
+  
+  # range per species
+  range_v <- seq(min(d_raw$raw_v[d_raw$species == sp_f[i]]), 
+                 max(d_raw$raw_v[d_raw$species == sp_f[i]]), length.out = 100)
+  
+  # expand grid
+  newdat <- expand.grid(v = range_v, 
+                        species = sp_f[i])
+  
+  # add transformed variables
+  newdat$v.l <- predict(v.poly, newdat$v)[,1]
+  newdat$v.q <- predict(v.poly, newdat$v)[,2]
+  
+  # model matrix & fitmat
+  Xmat   <- model.matrix(~ v.l + v.q, data = newdat)
+  fitmat <- matrix(ncol = nrow(drws), nrow = nrow(newdat))
+  
+  # matrices multiplication
+  for (j in 1:nrow(drws)) {
+    
+    fitmat[,j] <- plogis(Xmat %*% c(get_draws("mu1")[j,i],
+                                    get_draws("b_v1_l")[j,i],
+                                    get_draws("b_v1_q")[j,i]))
+    
+  }
+  
+  # obtain fit
+  newdat$fit <- plogis(mean(get_draws("mu1")[,i]) + 
+                       mean(get_draws("b_v1_l")[,i]) * newdat$v.l + 
+                       mean(get_draws("b_v1_q")[,i]) * newdat$v.q)
+  sim_sp <- cbind(species = sp_f[i], get_sims(newdat$v))
+  
+  # store posterior predictions
+  pp  <- rbind(pp, newdat)
+  sim <- rbind(sim, sim_sp)
+  
+}
+
+# plot per species 
+g2 <- ggplot() +
+  geom_rect(data = data.frame(species = sp_f), aes(alpha = species), 
+            xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf) +
+  scale_alpha_manual(values = c(0, 0, 0, 0.2, 0.2)) + 
+  geom_line(aes(x = x, y = sim, group = draw, color = species), data = sim, alpha = 0.2) +
+  geom_line(data = pp, aes(x = v, y = fit, color = species), size = 2) + facet_grid(. ~ species) +
+  geom_jitter(data = d_raw, aes(x = raw_v, y = status, color = species), height = 0.02, alpha = 0.3) +
+  geom_boxplot(data = d_raw[d_raw$status == 1,], aes(x = raw_v, y = 1),
+               orientation = "y", width = 0.1, size = 1.4, alpha = 0) +
+  geom_boxplot(data = d_raw[d_raw$status == 0,], aes(x = raw_v, y = 0),
+               orientation = "y", width = 0.1, size = 1.4, alpha = 0) +
+  scale_color_manual(values = clrs) + scale_fill_manual(values = clrs) +
+  scale_x_continuous(labels = c(-10, 0, 10), breaks = c(-10, 0, 10), limits = c(NA, 10)) + 
+  scale_y_continuous(trans="S_sqrt", breaks = seq(0, 1, 0.2), minor_breaks = seq(0.1, 0.9, 0.1)) +
+  labs(x = "northward wind [m/s]", y = NULL) +
+  theme_bw(base_size = 20) + theme(legend.position = "none", strip.text.x = element_blank())
+
+##### pressure change #####
+
+# define data storage
+pp  <- data.frame()
+sim <- data.frame()
+
+for (i in 1:n.sp) {
+  
+  # range per species
+  range_pc <- seq(min(d_raw$raw_pc[d_raw$species == sp_f[i]]), 
+                  max(d_raw$raw_pc[d_raw$species == sp_f[i]]), length.out = 100)
+  
+  # expand grid
+  newdat <- expand.grid(pc = range_pc, 
+                        species = sp_f[i])
+  
+  # add transformed variable
+  newdat$pc.z <- (range_pc - mean(pc)) / sd(pc)
+  
+  # model matrix & fitmat
+  Xmat   <- model.matrix(~ pc.z, data = newdat)
+  fitmat <- matrix(ncol = nrow(drws), nrow = nrow(newdat))
+  
+  # matrices multiplication
+  for (j in 1:nrow(drws)) {
+    
+      fitmat[,j] <- plogis(Xmat %*% c(get_draws("mu1")[j,i],
+                                      get_draws("b_p1")[j,i]))
+    
+  }
+  
+  # obtain fit
+  newdat$fit <- plogis(mean(get_draws("mu1")[,i]) + mean(get_draws("b_p1")[,i]) * newdat$pc.z)
+  sim_sp <- cbind(species = sp_f[i], get_sims(newdat$pc))
+  
+  # store posterior predictions
+  pp  <- rbind(pp, newdat)
+  sim <- rbind(sim, sim_sp)
+  
+}
+
+# plot per species 
+g3 <- ggplot(pp, aes(x = pc, group = species)) +
+  geom_line(aes(x = x, y = sim, group = draw, color = species), data = sim, alpha = 0.2) +
+  geom_line(aes(y = fit, color = species), size = 2) + facet_grid(. ~ species) +
+  geom_jitter(aes(x = raw_pc, y = status, color = species), data = d_raw, height = 0.02, alpha = 0.3) +
+  geom_boxplot(aes(x = raw_pc, y = 1), data = d_raw[d_raw$status == 1,], 
+               orientation = "y", width = 0.1, size = 1.4, alpha = 0) +
+  geom_boxplot(aes(x = raw_pc, y = 0), data = d_raw[d_raw$status == 0,], 
+               orientation = "y", width = 0.1, size = 1.4, alpha = 0) +
+  scale_color_manual(values = clrs) + scale_fill_manual(values = clrs) +
+  scale_x_continuous(labels = c(-10, 0, 10), breaks = c(-1000, 0, 1000)) + 
+  scale_y_continuous(trans="S_sqrt", breaks = seq(0, 1, 0.2), minor_breaks = seq(0.1, 0.9, 0.1)) +
+  labs(x = "pressure change [hPa]", y = NULL) +
+  theme_bw(base_size = 20) + theme(legend.position = "none")
+
+# plot estimates
+tmp <- data.frame(sp   = rep(1:5, each = nrow(drws)), 
+                  sims = c(get_draws("b_p1")))
+
+g3e <- ggplot() +
+  geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = 4, ymax = Inf), alpha = 0.2) +
+  tidybayes::stat_halfeye(data = tmp, aes(x = sims, y = sp, fill = as.factor(sp)),
+                          point_interval = "mean_hdi", .width = 0.9, slab_alpha = 0.7) +
+  geom_vline(xintercept = 0, lty = 2) +
+  scale_fill_manual(values = clrs) + 
+  scale_x_continuous(breaks = -1:1) +
+  scale_y_continuous(breaks = 1:5, minor_breaks = NULL, labels = sp_f, limits = c(0.8, 6)) +
+  labs(title = "pressure change", x = NULL, y = NULL) + theme_bw(base_size = 20) + 
+  theme(legend.position = "none", plot.title = element_text(size = 15),
+        axis.text.y = element_text(face = txt_styl))
+
+##### humidity #####
+
+# define data storage
+pp  <- data.frame()
+sim <- data.frame()
+
+for (i in 1:n.sp) {
+  
+  # range per species
+  range_h <- seq(min(d_raw$raw_h[d_raw$species == sp_f[i]]), 
+                 max(d_raw$raw_h[d_raw$species == sp_f[i]]), length.out = 100)
+  
+  # expand grid
+  newdat <- expand.grid(h = range_h, 
+                        species = sp_f[i])
+  
+  # add transformed variable
+  newdat$h.z <- (range_h - mean(h)) / sd(h)
+  
+  # model matrix & fitmat
+  Xmat   <- model.matrix(~ h.z, data = newdat)
+  fitmat <- matrix(ncol = nrow(drws), nrow = nrow(newdat))
+  
+  # matrices multiplication
+  for (j in 1:nrow(drws)) {
+    
+      fitmat[,j] <- plogis(Xmat %*% c(get_draws("mu1")[j,i],
+                                      get_draws("b_h1")[j,i]))
+    
+  }
+  
+  # obtain fit
+  newdat$fit <- plogis(mean(get_draws("mu1")[,i]) + mean(get_draws("b_h1")[,i]) * newdat$h.z)
+  sim_sp <- cbind(species = sp_f[i], get_sims(newdat$h))
+  
+  # store posterior predictions
+  pp  <- rbind(pp, newdat)
+  sim <- rbind(sim, sim_sp)
+  
+}
+
+# plot per species 
+g4 <- ggplot(pp, aes(x = h, group = species)) +
+  geom_line(aes(x = x, y = sim, group = draw, color = species), data = sim, alpha = 0.2) +
+  geom_line(aes(y = fit, color = species), size = 2) + facet_grid(. ~ species) +
+  geom_jitter(aes(x = raw_h, y = status, color = species), data = d_raw, height = 0.02, alpha = 0.3) +
+  geom_boxplot(aes(x = raw_h, y = 1), data = d_raw[d_raw$status == 1,], 
+               orientation = "y", width = 0.1, size = 1.4, alpha = 0) +
+  geom_boxplot(aes(x = raw_h, y = 0), data = d_raw[d_raw$status == 0,], 
+               orientation = "y", width = 0.1, size = 1.4, alpha = 0) +
+  scale_color_manual(values = clrs) + scale_fill_manual(values = clrs) +
+  scale_y_continuous(trans="S_sqrt", breaks = seq(0, 1, 0.2), minor_breaks = seq(0.1, 0.9, 0.1)) +
+  labs(x = "relative humidity", y = NULL) +
+  theme_bw(base_size = 20) + theme(legend.position = "none", strip.text.x = element_blank())
+
+# plot estimates
+tmp <- data.frame(sp   = rep(1:5, each = nrow(drws)), 
+                  sims = c(get_draws("b_h1")))
+
+g4e <- ggplot() +
+  geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = 4, ymax = Inf), alpha = 0.2) +
+  tidybayes::stat_halfeye(data = tmp, aes(x = sims, y = sp, fill = as.factor(sp)), 
+                          point_interval = "mean_hdi", .width = 0.9, slab_alpha = 0.7) +
+  geom_vline(xintercept = 0, lty = 2) +
+  ggtext::geom_richtext(aes(x = 1.25, y = 5,   label = "long",  angle = 90,label.size = NA)) +
+  ggtext::geom_richtext(aes(x = 1.25, y = 2.5, label = "short", angle = 90,label.size = NA)) +
+  scale_fill_manual(values = clrs) + 
+  scale_y_continuous(breaks = 1:5, minor_breaks = NULL, limits = c(0.8, 6)) +
+  labs(title = "relative humidity", x = NULL, y = NULL) + theme_bw(base_size = 20) + 
+  theme(legend.position = "none", plot.title = element_text(size = 15),
+        axis.text.y = element_blank(), axis.ticks.y = element_blank())
+
+##### precipitation #####
+
+# calculate contrast
+p_con <- plogis(rowMeans(get_draws("mu1")) + get_draws("b_r1")) - plogis(rowMeans(get_draws("mu1")))
+
+# plot
+g5 <- ggplot() +
+    tidybayes::stat_halfeye(aes(p_con), interval_size = 5, point_size = 3, 
+                          slab_fill = "#8B8682", slab_alpha = 0.5,
+                          point_interval = "mean_hdi", .width = 0.9) +
+  geom_vline(xintercept = 0, lty = 2) +
+  labs(x = "change in mean\ndeparture probability", y = NULL) + 
+  scale_y_continuous(breaks = 0, limits = c(-0.03, 1)) +
+  theme_bw(base_size = 20) +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        panel.grid.major.x = element_blank(), panel.grid.minor.x = element_blank())
+
+grid.arrange(g1, g2, nrow = 2, heights = c(5, 4.4),
+             left = textGrob("departure probability", gp = gpar(fontsize = 20), rot = 90))
+
+grid.arrange(g3, g4, nrow = 2, heights = c(5, 4.5),
+             left = textGrob("departure probability", gp = gpar(fontsize = 20), rot = 90))
+
+grid.arrange(g3e, g4e, nrow = 1, widths = c(5, 3.3),
+             bottom = textGrob("effect size", gp = gpar(fontsize = 20), hjust = 0, vjust = -0.1))
+
+g5
+
+```
+
+### Departure decision
+
+```{r effects chi}
+
+
+########## chi ##########
+
+##### mean #####
+
+# per species
+tmp.c   <- as.data.frame(smry.ms[42:46,])
+tmp.c.r <- data.frame(sp  = rep(1:5, each = smpls),
+                      sim = c(get_draws("mean_chi")[1:smpls,]))
+
+g.c <- ggplot() +
+  geom_rect(aes(xmin = 3.5, xmax = Inf, ymin = -Inf, ymax = Inf), alpha = 0.2) +
+  geom_hline(yintercept = mean(tmp.c$mean), size = 1.5, alpha = 0.3) +
+  geom_jitter(data = tmp.c.r, aes(x = sp, y = sim, color = as.factor(sp)), width = 0.15, alpha = 0.1) +
+  geom_text(data = tmp.c, aes(x = 1:5, y = mean, angle = 90), 
+            label = "|", size = 10, vjust = 0.34, color = clrs[1:5]) +
+  scale_x_continuous(breaks = 1:5, minor_breaks = NULL, labels = sp_f) +
+  scale_y_continuous(breaks = seq(0, 1, 0.2), limits = c(0, 1)) +
+  scale_color_manual(values = clrs[1:5]) +
+  labs(x = NULL, y = "probability for\noffshore flight") + theme_bw(base_size = 20) + 
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 35, vjust = 1, hjust = 1, face = txt_styl),
+        plot.margin = unit(c(0.15, 0.05, 0.1, 0.2), "cm"))
+
+# contrast per strategy
+p_con.c <- rowMeans(get_draws("mean_chi")[,c(4:5)]) - rowMeans(get_draws("mean_chi")[,c(1:3)])
+
+g.c.st <- ggplot() +
+  tidybayes::stat_halfeye(aes(p_con.c), interval_size = 5, point_size = 3, 
+                          slab_fill = "#8B8682", slab_alpha = 0.5,
+                          point_interval = "mean_hdi", .width = 0.9) +
+  geom_vline(xintercept = 0, lty = 2) +
+  labs(x = NULL, y = "contrasts") +
+  scale_x_continuous(position = "top", breaks = c(-0.2, 0, 0.2), limits = c(-0.3, 0.3)) +
+  scale_y_continuous(breaks = 0, limits = c(-0.1, 1)) +
+  theme_bw(base_size = 20) + coord_flip() +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        panel.grid.major.y = element_blank(), panel.grid.minor.y = element_blank(),
+        plot.margin = unit(c(0.15, 0.3, 1.37, 0.5), "cm"))
+
+grid.arrange(g.t, g.t.st, g.c, g.c.st, nrow = 2, widths = c(5, 2.5), heights = c(4.1, 5))
+
+##### raw data#####
+
+d_raw <- data.frame(status = rep(NA, nrow(dh)))
+
+for (i in 1:nrow(dh)) {
+  
+  if (max(dh[i, dh[i,] != 4]) == 3) 
+    d_raw$status[i] <- 0
+  if (max(dh[i, dh[i,] != 4]) == 2) 
+    d_raw$status[i] <- 1
+  d_raw$raw_u[i] <- u[i, min(which(dh[i,] != 1))]
+  d_raw$raw_v[i] <- v[i, min(which(dh[i,] != 1))]
+  
+}
+
+d_raw <- na.omit(d_raw)
+
+##### u wind #####
+
+# range 
+range_u <- seq(min(d_raw$raw_u), max(d_raw$raw_u), length.out = 100)
+  
+# new data
+newdat <- data.frame(u = range_u)
+
+# add transformed variables
+newdat$u.l <- predict(u.poly, newdat$u)[,1]
+newdat$u.q <- predict(u.poly, newdat$u)[,2]
+
+# model matrix & fitmat
+Xmat   <- model.matrix(~ u.l + u.q, data = newdat)
+fitmat <- matrix(ncol = nrow(drws), nrow = nrow(newdat))
+
+# matrix multiplication
+for (i in 1:nrow(drws)) {
+  
+  fitmat[,i] <- plogis(Xmat %*% c(mean(get_draws("mu2")[i,]),
+                                  get_draws("b_u2_l")[i],
+                                  get_draws("b_u2_q")[i]))
+  
+}
+
+# obtain fit
+newdat$fit <- plogis(mean(get_draws("mu2")) + 
+                     mean(get_draws("b_u2_l")) * newdat$u.l + 
+                     mean(get_draws("b_u2_q")) * newdat$u.q) 
+sim <- get_sims(newdat$u)
+
+# plot 
+g1 <- ggplot(newdat, aes(x = u)) +
+  geom_line(aes(x = x, y = sim, group = draw), data = sim, color = "#8B8682", alpha = 0.3) +
+  geom_line(aes(y = fit), color = "#8B8682", size = 2.5) + 
+  geom_jitter(aes(x = raw_u, y = status), data = d_raw, color = "#8B8682", size = 2.5, height = 0.02, alpha = 0.3) +
+  geom_boxplot(aes(x = raw_u, y = 1), data = d_raw[d_raw$status == 1,], orientation = "y", width = 0.1, size = 1.4, alpha = 0) +
+  geom_boxplot(aes(x = raw_u, y = 0), data = d_raw[d_raw$status == 0,], orientation = "y", width = 0.1, size = 1.4, alpha = 0) +
+  labs(x = "eastward wind [m/s]", y = "probability for\noffshore flight") +
+  theme_bw(base_size = 20)
+
+##### v wind #####
+
+# range 
+range_v <- seq(min(d_raw$raw_v), max(d_raw$raw_v), length.out = 100)
+  
+# new data
+newdat <- data.frame(v = range_v)
+
+# add transformed variables
+newdat$v.l    <- predict(v.poly, newdat$v)[,1]
+newdat$v.q    <- predict(v.poly, newdat$v)[,2]
+
+# model matrix & fitmat
+Xmat   <- model.matrix(~ v.l + v.q, data = newdat)
+fitmat <- matrix(ncol = nrow(drws), nrow = nrow(newdat))
+
+# matrix multiplication
+for (i in 1:nrow(drws)) {
+  
+  fitmat[,i] <- plogis(Xmat %*% c(mean(get_draws("mu2")[i,]),
+                                  get_draws("b_v2_l")[i],
+                                  get_draws("b_v2_q")[i]))
+  
+}
+
+# obtain fit
+newdat$fit <- plogis(mean(get_draws("mu2")) + 
+                     mean(get_draws("b_v2_l")) * newdat$v.l + 
+                     mean(get_draws("b_v2_q")) * newdat$v.q)
+sim <- get_sims(newdat$v)
+
+# plot 
+g2 <- ggplot(newdat, aes(x = v)) +
+  geom_line(aes(x = x, y = sim, group = draw), data = sim, color = "#8B8682", alpha = 0.3) +
+  geom_line(aes(y = fit), color = "#8B8682", size = 2.5) + 
+  geom_jitter(aes(x = raw_v, y = status), data = d_raw, color = "#8B8682", size = 2.5, height = 0.02, alpha = 0.3) +
+  geom_boxplot(aes(x = raw_v, y = 1), data = d_raw[d_raw$status == 1,], orientation = "y", width = 0.1, size = 1.4, alpha = 0) +
+  geom_boxplot(aes(x = raw_v, y = 0), data = d_raw[d_raw$status == 0,], orientation = "y", width = 0.1, size = 1.4, alpha = 0) +
+  labs(x = "northward wind [m/s]", y = NULL) +
+  theme_bw(base_size = 20) + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
+
+grid.arrange(g1, g2, ncol = 2, widths = c(5, 3.6))
+
+```
+
+### Predict departure decision
+
+Predicted probability for offshore flights for individuals with unknown routing.
+
+```{r predict departure decision}
+
+
+########## predict chi ##########
+
+##### raw data #####
+
+d_raw <- data.frame(sp = NA, 
+                    species = factor(rep(NA, nrow(dh)),
+                    levels = c("Dunnock", "thrushes", "Blackcap", "Garden W.", "Wheatear"), 
+                    ordered = T))
+
+for (i in 1:nrow(dh)) {
+  
+  d_raw$sp[i]      <- sp[i]  
+  d_raw$species[i] <- sp_f[sp[i]]
+  d_raw$u.l[i]     <- ifelse(any(dh[i,] %in% c(2,3)), NA, u.l[i, min(which(dh[i,] != 1))])
+  d_raw$u.q[i]     <- ifelse(any(dh[i,] %in% c(2,3)), NA, u.q[i, min(which(dh[i,] != 1))])
+  d_raw$v.l[i]     <- ifelse(any(dh[i,] %in% c(2,3)), NA, v.l[i, min(which(dh[i,] != 1))])
+  d_raw$v.q[i]     <- ifelse(any(dh[i,] %in% c(2,3)), NA, v.q[i, min(which(dh[i,] != 1))])
+  
+}
+
+d_raw <- na.omit(d_raw)
+
+##### predictions per species #####
+
+# define data storage
+pp <- data.frame()
+
+for (i in 1:n.sp) {
+
+  newdat <- d_raw[d_raw$species == sp_f[i],]
+  
+  # model matrix & fitmat
+  Xmat   <- model.matrix(~ u.l + u.q + v.l + v.q, data = newdat)
+  fitmat <- matrix(ncol = nrow(drws), nrow = nrow(newdat))
+  
+  # matrices multiplication
+  for (j in 1:nrow(drws)) {
+
+    fitmat[,j] <- plogis(Xmat %*% c(get_draws("mu2")[j,i],
+                                    get_draws("b_u2_l")[j],
+                                    get_draws("b_u2_q")[j],
+                                    get_draws("b_v2_l")[j],
+                                    get_draws("b_v2_q")[j]))
+
+  }
+  
+  # obtain fit
+  newdat$lwr <- apply(fitmat, 1, function(x) hdi(x, 0.9))[1,]
+  newdat$upr <- apply(fitmat, 1, function(x) hdi(x, 0.9))[2,]
+  newdat$fit <- plogis(mean(get_draws("mu2")[,i]) + 
+                       mean(get_draws("b_u2_l")) * newdat$u.l + mean(get_draws("b_u2_q")) * newdat$u.q +
+                       mean(get_draws("b_v2_l")) * newdat$v.l + mean(get_draws("b_v2_q")) * newdat$v.q) 
+  
+  # store posterior predictions
+  pp <- rbind(pp, newdat)
+  
+}
+
+pp <- pp %>%
+  arrange(species, fit) %>%
+  mutate(id = 1:n(), mean = colMeans(get_draws("mean_chi"))[sp])
+
+# plot per species
+g <- ggplot() +
+  geom_rect(data = data.frame(species = sp_f), aes(alpha = species), 
+            xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf) +
+  scale_alpha_manual(values = c(0, 0, 0, 0.2, 0.2)) + 
+  geom_hline(data = pp, aes(yintercept = mean, group = species, color = species), 
+             lty = 1, lwd = 2, alpha = 0.5) +
+  geom_linerange(data = pp, aes(x = 1, xmax = 1, ymin = lwr, ymax = upr, group = id, color = species), 
+                 alpha = 0.5, position = position_dodge(0.8)) +
+  geom_point(data = pp, aes(x = 1, y = fit, group = id, color = species), 
+             size = 3, position = position_dodge(0.8)) +
+  scale_color_manual(values = clrs) + facet_grid(. ~ species) +
+  labs(x = NULL, y = "probability for offshore flight") + ylim(c(0, 1)) +
+  theme_bw(base_size = 20) + 
+  theme(legend.position = "none", axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+g <- ggplotGrob(g)
+
+g$grobs[[20]]$grobs[[1]]$children[[2]]$children[[1]]$gp$font <- as.integer(3)
+attr(g$grobs[[20]]$grobs[[1]]$children[[2]]$children[[1]]$gp$font,"names") <- "italic"
+
+grid.draw(g)
+
+```
+
+## Inspect model parameter convergence
+
+Checking chains for convergence.
+
+```{r check convergence ms, echo=FALSE, out.width='90%', fig.align = "center"}
+diagMCMC(drws)
+```
+
+```{r save model summaries}
+
+save(smry.ms, smry.mod1, smry.mod2,
+     con.mod1, diff_route.mod1, diff_strategy.mod1,
+     con.mod2, diff_route.mod2, file = "model_summaries.RData")
+
+```
